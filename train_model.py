@@ -1,145 +1,136 @@
-# ================================
-# train_model.py  (UPDATED WITH PREPROCESSING)
-# ================================
-
-import os
-import pickle
-import re
-
+# train_model.py (robust beginner-friendly)
 import pandas as pd
-
+import numpy as np
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import joblib, json, sys
 
-# ---------- NLP imports ----------
-import nltk
-from nltk.stem import WordNetLemmatizer
-from nltk.corpus import stopwords
+ROOT = Path(".")
+DATA_PATH = ROOT / "data" / "resumes.csv"   # change if your CSV is elsewhere
 
-# Download NLTK resources (only first time; later they are cached)
-nltk.download("wordnet")
-nltk.download("stopwords")
+# -------------------------------------------------------------------------
+# 1) Load CSV safely and show columns if label column missing
+# -------------------------------------------------------------------------
+if not DATA_PATH.exists():
+    print(f"ERROR: Dataset not found at {DATA_PATH}. Please put your CSV at this path.")
+    sys.exit(1)
 
-lemmatizer = WordNetLemmatizer()
-stop_words = set(stopwords.words("english"))
+# Try common encodings if default fails
+for enc in ["utf-8", "latin1", "utf-8-sig"]:
+    try:
+        df = pd.read_csv(DATA_PATH, encoding=enc)
+        break
+    except Exception as e:
+        df = None
 
-# ================================
-# 1. Text Preprocessing Function
-# ================================
-def preprocess_text(text: str) -> str:
-    """
-    Clean and normalize resume text:
-    - convert to lowercase
-    - remove non-letters
-    - remove stopwords
-    - lemmatize words
-    """
-    # convert to string just in case
-    text = str(text)
+if df is None:
+    print("Failed to read CSV with common encodings. Open the file and check encoding.")
+    sys.exit(1)
 
-    # lowercase
-    text = text.lower()
+print("Loaded dataset. Columns:", df.columns.tolist())
 
-    # keep only letters and spaces
-    text = re.sub(r"[^a-z\s]", " ", text)
+# -------------------------------------------------------------------------
+# 2) Detect label (target) column automatically
+# -------------------------------------------------------------------------
+possible_label_names = ["label", "target", "category", "class", "y", "tag"]
+label_col = None
+for name in possible_label_names:
+    if name in df.columns:
+        label_col = name
+        break
 
-    # tokenize by spaces
-    words = text.split()
+# If not found, try heuristic: if there are exactly 2 columns, assume second is label
+if label_col is None:
+    if len(df.columns) == 2:
+        label_col = df.columns[1]
+        print(f"No common label name found — assuming second column '{label_col}' is the label.")
+    else:
+        print("\nCould not auto-detect label column.")
+        print("Available columns:", df.columns.tolist())
+        print("\nHere are the first 5 rows to help you choose:")
+        print(df.head().to_string())
+        print("\nSOLUTION OPTIONS:")
+        print("1) Rename your label column to one of: ", possible_label_names)
+        print("   e.g. open CSV and change header to 'label'")
+        print("2) Or edit train_model.py and set label_col = '<your_column_name>' manually near the top.")
+        sys.exit(1)
 
-    # remove stopwords and lemmatize
-    cleaned_words = [
-        lemmatizer.lemmatize(word)
-        for word in words
-        if word not in stop_words
-    ]
+print("Using label column:", label_col)
 
-    # join back to a single string
-    return " ".join(cleaned_words)
+# -------------------------------------------------------------------------
+# 3) Prepare X and y
+# -------------------------------------------------------------------------
+if "text" in df.columns:
+    text_col = "text"
+else:
+    # try common names for text column
+    for cand in ["resume", "resume_text", "content", "description", "cv", "document"]:
+        if cand in df.columns:
+            text_col = cand
+            break
+    else:
+        # fallback: assume first column that is not label
+        text_candidates = [c for c in df.columns if c != label_col]
+        if len(text_candidates) >= 1:
+            text_col = text_candidates[0]
+            print(f"No explicit text column found — using '{text_col}' as text.")
+        else:
+            print("No text column found. Please ensure your CSV has a column with resume text.")
+            sys.exit(1)
 
+print("Using text column:", text_col)
 
-# ================================
-# 2. Paths & setup
-# ================================
-DATA_PATH = "data/resumes.csv"
-MODEL_DIR = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "resume_model.pkl")
-VEC_PATH = os.path.join(MODEL_DIR, "tfidf_vectorizer.pkl")
+df[text_col] = df[text_col].fillna("").astype(str)
+df[label_col] = df[label_col].astype(str)
 
-os.makedirs(MODEL_DIR, exist_ok=True)
+X = df[text_col].values
+y = df[label_col].values
 
-# ================================
-# 3. Load dataset
-# ================================
-print(f"Loading dataset from: {DATA_PATH}")
-df = pd.read_csv(DATA_PATH)
+# -------------------------------------------------------------------------
+# 4) Train-test split & pipeline
+# -------------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y if len(np.unique(y))>1 else None)
 
-print("\nFirst 5 rows (raw):")
-print(df.head())
-
-print("\nCategory counts:")
-print(df["category"].value_counts())
-
-# Apply preprocessing to the text column
-print("\nApplying text preprocessing...")
-df["text_clean"] = df["text"].astype(str).apply(preprocess_text)
-
-print("\nFirst 5 rows (after preprocessing):")
-print(df[["text", "text_clean"]].head())
-
-X = df["text_clean"]
-y = df["category"]
-
-# ================================
-# 4. Train–test split
-# ================================
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
+pipeline = make_pipeline(
+    TfidfVectorizer(max_features=20000, ngram_range=(1,2), stop_words='english'),
+    LogisticRegression(max_iter=400, C=1.0)
 )
 
-print(f"\nTrain size: {len(X_train)}, Test size: {len(X_test)}")
+print("Training pipeline ...")
+pipeline.fit(X_train, y_train)
+joblib.dump(pipeline, ROOT / "pipeline.pkl")
+print("Saved pipeline.pkl to project root.")
 
-# ================================
-# 5. Text → TF-IDF features
-# ================================
-tfidf = TfidfVectorizer(
-    max_features=5000,
-    ngram_range=(1, 2),     # use unigrams + bigrams
-)
-
-X_train_tfidf = tfidf.fit_transform(X_train)
-X_test_tfidf = tfidf.transform(X_test)
-
-# ================================
-# 6. Train model (Naive Bayes)
-# ================================
-model = MultinomialNB()
-model.fit(X_train_tfidf, y_train)
-# ================================
-# 7. Evaluate model
-# ================================
-y_pred = model.predict(X_test_tfidf)
-
+# -------------------------------------------------------------------------
+# 5) Evaluation & save metrics.json
+# -------------------------------------------------------------------------
+y_pred = pipeline.predict(X_test)
 acc = accuracy_score(y_test, y_pred)
-print(f"\nAccuracy on test set: {acc:.4f}")
+report = classification_report(y_test, y_pred, output_dict=True)
+cm = confusion_matrix(y_test, y_pred).tolist()
 
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
+classes = None
+try:
+    classes = list(pipeline.named_steps['logisticregression'].classes_)
+except Exception:
+    try:
+        classes = list(pipeline.classes_)
+    except Exception:
+        classes = None
 
-# ================================
-# 8. Save model and vectorizer
-# ================================
-with open(MODEL_PATH, "wb") as f:
-    pickle.dump(model, f)
+metrics = {
+    "accuracy": float(acc),
+    "report": report,
+    "confusion_matrix": cm,
+    "classes": classes
+}
 
-with open(VEC_PATH, "wb") as f:
-    pickle.dump(tfidf, f)
+with open(ROOT / "metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
 
-print(f"\nModel saved to: {MODEL_PATH}")
-print(f"Vectorizer saved to: {VEC_PATH}")
-print("\n✅ Training complete. You can now run:  python3 -m streamlit run app.py")
+print("Saved metrics.json")
+print("Done.")
